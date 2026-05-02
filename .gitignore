@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+env/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Models & weights (large binary files)
+models/*.pt
+models/*.pth
+models/*.task
+models/*.tflite
+
+# Data
+data/
+*.csv
+
+# Outputs / generated images
+outputs/
+*.png
+*.jpg
+*.jpeg
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env files
+.env
+*.env
+
+# Logs
+*.log

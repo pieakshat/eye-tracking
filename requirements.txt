@@ -1,0 +1,9 @@
+flask
+opencv-python
+mediapipe
+numpy
+scipy
+matplotlib
+torch
+torchvision
+pillow
