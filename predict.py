@@ -1,13 +1,17 @@
-import os, csv, time, threading, traceback
+import os, csv, time, threading, traceback, argparse
 import cv2, numpy as np
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 from flask import Flask, Response, jsonify, send_file, render_template_string, request
 from gaze_tracker_mp import MPGazeTracker
+from gaze_classifier import classify as algo_classify
 import torch, torch.nn as nn
 from torchvision import models, transforms
 from PIL import Image
+
+# Set by --resnet / --algo flag in __main__; read-only after startup.
+CLASSIFIER_MODE = "algo"
 
 SCREEN_W, SCREEN_H = 1920, 1080
 CSV_PATH     = "data/predict_gaze.csv"
@@ -19,23 +23,24 @@ os.makedirs("data", exist_ok=True)
 os.makedirs("outputs", exist_ok=True)
 os.makedirs("models", exist_ok=True)
 
+resnet_model = None   # loaded only when --resnet flag is passed
+resnet_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
 def load_resnet18():
+    global resnet_model
     model = models.resnet18(weights=None)
     model.fc = nn.Linear(model.fc.in_features, 2)
     if os.path.exists(MODEL_PATH):
         model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
         print("ResNet18 loaded from", MODEL_PATH)
     else:
-        print("WARNING: model not found at", MODEL_PATH)
+        print("WARNING: ResNet model not found at", MODEL_PATH)
     model.eval()
-    return model
-
-resnet_model = load_resnet18()
-resnet_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
+    resnet_model = model
 
 def classify_heatmap(img_path):
     try:
@@ -55,7 +60,7 @@ state = {
     "running": False, "gaze_points": [], "frame_count": 0,
     "fixation": False, "saccade": False, "current_xy": (0, 0),
     "heatmap_ready": False, "status": "idle", "child_name": "Child",
-    "classification": None, "confidence": 0.0,
+    "classification": None, "confidence": 0.0, "risk_score": None, "summary": None,
     "calib_point_idx": -1, "calib_total": 9,
     "calib_done": False, "calib_collecting": False,
     "drift_done": False, "drift_collecting": False, "drift_target": None,
@@ -146,42 +151,71 @@ def gen_heatmap():
         xs = np.array([p[0] for p in pts], dtype=float)
         ys = np.array([p[1] for p in pts], dtype=float)
 
-        # ── DIAGNOSTICS ──────────────────────────────────────────
         print(f"=== HEATMAP DIAGNOSTICS ===")
-        print(f"  Screen from state : {scr_w} x {scr_h}")
-        print(f"  Gaze points       : {len(pts)}")
+        print(f"  Screen            : {scr_w} x {scr_h}")
+        print(f"  Raw gaze points   : {len(pts)}")
         print(f"  X  min/mean/max   : {xs.min():.0f} / {xs.mean():.0f} / {xs.max():.0f}")
         print(f"  Y  min/mean/max   : {ys.min():.0f} / {ys.mean():.0f} / {ys.max():.0f}")
-        print(f"  Pts clipped to 0  : x={int((xs<=0).sum())}  y={int((ys<=0).sum())}")
-        print(f"  First 8 pts       : {pts[:8]}")
-        print(f"===========================")
-        # ─────────────────────────────────────────────────────────
 
-        xn = (xs / scr_w * W).astype(int).clip(0, W-1)
-        yn = (ys / scr_h * H).astype(int).clip(0, H-1)
-        hm = np.zeros((H, W))
-        for x, y in zip(xn, yn): hm[y, x] += 1
-        hm = gaussian_filter(hm, sigma=18)
+        # ── 1. IQR outlier removal ────────────────────────────────────────
+        # Removes points that landed in corners / edges due to calibration
+        # drift or tracking failure — they inflate density far from the text.
+        def iqr_mask(arr, k=2.0):
+            q1, q3 = np.percentile(arr, [25, 75])
+            iqr = q3 - q1
+            return (arr >= q1 - k * iqr) & (arr <= q3 + k * iqr)
+        mask = iqr_mask(xs) & iqr_mask(ys)
+        xs, ys = xs[mask], ys[mask]
+        print(f"  After IQR filter  : {mask.sum()} kept, {(~mask).sum()} outliers removed")
+        print(f"===========================")
+
+        # ── 2. Helper: build heatmap with 95th-percentile normalisation ───
+        # Clipping at p95 spreads the colour range across the actual reading
+        # area instead of letting one hot-spot dominate the entire scale.
+        def make_hm(x_arr, y_arr, w, h, sigma):
+            xn = (x_arr / scr_w * w).astype(int).clip(0, w - 1)
+            yn = (y_arr / scr_h * h).astype(int).clip(0, h - 1)
+            hm = np.zeros((h, w))
+            for px, py in zip(xn, yn): hm[py, px] += 1
+            hm = gaussian_filter(hm, sigma=sigma)
+            nz = hm[hm > 0]
+            if len(nz) == 0: return hm
+            p95 = np.percentile(nz, 95)
+            return np.clip(hm, 0, p95) / (p95 + 1e-6)
+
+        # ── 3. RGBA conversion — green→yellow→red, graduated alpha ────────
+        # Areas visited briefly show green; frequently fixated areas show red.
+        # Alpha scales from 0.15 (barely visited) to 0.80 (hot zone) so the
+        # reading text remains legible through the overlay everywhere.
+        CMAP = plt.cm.RdYlGn_r
+
+        def hm_to_rgba(hm):
+            rgba = CMAP(hm).astype(float)
+            rgba[:, :, 3] = np.where(hm > 0.01, 0.15 + hm * 0.65, 0.0)
+            return rgba
+
+        # ── matplotlib report heatmap (with text backdrop) ────────────────
+        hm = make_hm(xs, ys, W, H, sigma=14)
 
         fig, ax = plt.subplots(figsize=(16, 9), facecolor="#fffef9")
         ax.set_facecolor("#fffef9"); ax.set_xlim(0, W); ax.set_ylim(H, 0)
 
         lines = [
-            "When Mary Lennox was sent to Misselthwaite Manor to live with her uncle,",
-            "everybody said she was the most disagreeable-looking child ever seen.",
-            "It was true, too. She had a little thin face and a little thin body,",
-            "thin light hair and a sour expression.", "",
-            "Her father had held a position under the English Government and had always",
-            "been busy and ill himself, and her mother had been a great beauty who cared",
-            "only to go to parties and amuse herself with gay people.",
-            "She had not wanted a little girl at all.", "",
-            "When Mary was born she handed her over to the care of an Ayah, who was",
-            "made to understand that if she wished to please the Mem Sahib she must",
-            "keep the child out of sight as much as possible.",
+            "Alice was beginning to get very tired of sitting by her sister on the bank,",
+            "and of having nothing to do. Once or twice she had peeped into the book her",
+            "sister was reading, but it had no pictures or conversations in it, and what",
+            "is the use of a book without pictures or conversations?", "",
+            "So she was considering in her own mind whether the pleasure of making a",
+            "daisy-chain would be worth the trouble of getting up and picking the daisies,",
+            "when suddenly a White Rabbit with pink eyes ran close by her.", "",
+            "There was nothing so very remarkable in that; nor did Alice think it so very",
+            "much out of the way to hear the Rabbit say to itself, \"Oh dear! Oh dear!",
+            "I shall be late!\" But when the Rabbit took a watch out of its",
+            "waistcoat-pocket and looked at it, Alice started to her feet.",
         ]
-        ax.text(W//2, 55, "The Secret Garden", fontsize=22, fontweight="bold",
+        ax.text(W//2, 55, "Alice's Adventures in Wonderland", fontsize=22, fontweight="bold",
                 color="#1a1612", ha="center", va="center", fontfamily="serif")
-        ax.text(W//2, 90, "— Frances Hodgson Burnett", fontsize=12, color="#8a7f74",
+        ax.text(W//2, 90, "— Lewis Carroll", fontsize=12, color="#8a7f74",
                 ha="center", va="center", fontstyle="italic", fontfamily="serif")
         ax.plot([W//2-40, W//2+40], [108, 108], color="#c4432a", linewidth=2)
         for i, line in enumerate(lines):
@@ -189,14 +223,15 @@ def gen_heatmap():
                 ax.text(120, 145+i*38, line, fontsize=11, color="#3d3530",
                         va="center", fontfamily="serif")
 
-        hm_norm = hm / (hm.max() + 1e-6)
-        ax.imshow(hm_norm, extent=[0, W, H, 0], cmap="inferno", alpha=0.55,
-                  interpolation="bilinear", origin="upper", vmin=0.02)
-        sm = plt.cm.ScalarMappable(cmap="inferno",
-                                   norm=plt.Normalize(vmin=0, vmax=hm.max()))
+        ax.imshow(hm_to_rgba(hm), extent=[0, W, H, 0],
+                  interpolation="bilinear", origin="upper")
+
+        sm = plt.cm.ScalarMappable(cmap=CMAP, norm=plt.Normalize(vmin=0, vmax=1))
         sm.set_array([])
         cbar = plt.colorbar(sm, ax=ax, fraction=0.02, pad=0.01)
         cbar.set_label("Gaze Density", color="#3d3530", fontsize=9)
+        cbar.set_ticks([0, 0.5, 1.0])
+        cbar.set_ticklabels(["Low", "Medium", "High"])
         ax.set_title("Gaze Heatmap — Attention Density on Reading Task",
                      fontsize=13, color="#1a1612", pad=10, fontfamily="serif")
         ax.axis("off")
@@ -204,34 +239,38 @@ def gen_heatmap():
         plt.savefig(HEATMAP_PATH, dpi=120, bbox_inches="tight", facecolor="#fffef9")
         plt.close()
 
-        # RGBA overlay at exact screen resolution — no text baked in.
-        # When displayed fullscreen in the browser over the reading layout,
-        # gaze pixels align 1:1 with screen coordinates.
-        hm_scr = np.zeros((scr_h, scr_w))
-        xi = xs.astype(int).clip(0, scr_w - 1)
-        yi = ys.astype(int).clip(0, scr_h - 1)
-        for px, py in zip(xi, yi):
-            hm_scr[py, px] += 1
-        sigma_px = max(scr_w, scr_h) * 0.025
-        hm_scr = gaussian_filter(hm_scr, sigma=sigma_px)
-        hm_scr_n = hm_scr / (hm_scr.max() + 1e-6)
-        rgba_f = plt.cm.inferno(hm_scr_n)           # (H, W, 4) float [0,1]
-        rgba_f[:, :, 3] = np.where(
-            hm_scr_n > 0.015,
-            np.minimum(hm_scr_n * 0.80, 0.88),
-            0.0
-        )
-        ov_uint8 = (rgba_f * 255).astype(np.uint8)
+        # ── RGBA overlay at exact screen resolution ────────────────────────
+        hm_scr = make_hm(xs, ys, scr_w, scr_h, sigma=max(scr_w, scr_h) * 0.020)
+        ov_uint8 = (hm_to_rgba(hm_scr) * 255).astype(np.uint8)
         Image.fromarray(ov_uint8, mode="RGBA").save(OVERLAY_PATH)
         print("Overlay saved:", OVERLAY_PATH)
 
-        label, conf = classify_heatmap(HEATMAP_PATH)
-        print(f"Classification: {label} ({conf}%)")
+        if CLASSIFIER_MODE == "resnet":
+            label, conf = classify_heatmap(HEATMAP_PATH)
+            risk_score  = conf / 100.0 if label == "Dyslexic" else (1.0 - conf / 100.0)
+            summary     = None
+            print(f"[ResNet]  {label}  ({conf}%)")
+        else:
+            with lock:
+                sw = state.get("screen_w", SCREEN_W)
+                sh = state.get("screen_h", SCREEN_H)
+            result     = algo_classify(CSV_PATH, screen_w=sw, screen_h=sh)
+            label      = result["label"]
+            conf       = result["confidence"]
+            risk_score = result["risk_score"] if result["risk_score"] is not None else 0.5
+            summary    = result["summary"]
+            print(f"[Algo]  {label}  risk={risk_score:.3f}  conf={conf}%")
+            print(f"  summary: {summary}")
+            for feat, d in result["features"].items():
+                print(f"  {feat:<30}  val={d['value']:<10}  score={d['score']:.3f}  w={d['weight']}")
+
         with lock:
             state["heatmap_ready"]  = True
             state["status"]         = "done"
             state["classification"] = label
             state["confidence"]     = conf
+            state["risk_score"]     = risk_score
+            state["summary"]        = summary
         print("Heatmap saved:", HEATMAP_PATH)
 
     except Exception as e:
@@ -650,6 +689,9 @@ def get_state():
             child_name=str(state["child_name"]),
             classification=str(state["classification"]) if state["classification"] else None,
             confidence=float(state["confidence"]),
+            risk_score=float(state["risk_score"]) if state["risk_score"] is not None else None,
+            summary=state["summary"],
+            classifier_mode=CLASSIFIER_MODE,
             calib_point_idx=int(state["calib_point_idx"]),
             calib_total=int(state["calib_total"]),
             calib_done=bool(state["calib_done"]),
@@ -922,7 +964,7 @@ body{background:#0d0d0d;overflow:hidden}
         </div>
         <div>
           <div id="res-class-card" class="class-badge">
-            <div class="class-lbl">ResNet18 Classification</div>
+            <div class="class-lbl" id="res-class-lbl">Classification</div>
             <div id="res-class-name" class="class-name"></div>
             <div id="res-class-conf-txt" class="class-conf-txt"></div>
             <div class="conf-bar"><div id="res-conf-fill" class="conf-fill"></div></div>
@@ -937,6 +979,12 @@ body{background:#0d0d0d;overflow:hidden}
               <div class="stat-row"><span class="stat-k">Horiz. Spread</span><span class="stat-v" id="r-sx">—</span></div>
               <div class="stat-row"><span class="stat-k">Vert. Coverage</span><span class="stat-v" id="r-sy">—</span></div>
               <div class="stat-row"><span class="stat-k">L→R Progression</span><span class="stat-v" id="r-ltr">—</span></div>
+            </div>
+          </div>
+          <div id="res-risk-wrap" style="display:none;margin-top:14px;padding:14px 16px;background:#fff;border:1px solid #e0d8cc;border-radius:10px">
+            <div style="font-family:'DM Mono',monospace;font-size:.63rem;color:#8a7f74;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px" id="res-risk-label">Risk Score</div>
+            <div style="height:8px;background:#e0d8cc;border-radius:100px;overflow:hidden">
+              <div id="res-risk-fill" style="height:100%;border-radius:100px;transition:width .8s ease;width:0%"></div>
             </div>
           </div>
           <div id="res-note" style="margin-top:14px;padding:14px 16px;border-radius:10px;font-family:'DM Mono',monospace;font-size:.68rem;line-height:1.8;display:none"></div>
@@ -1117,6 +1165,8 @@ function populateResults(d, rep) {
   document.getElementById("results-content").style.display = "block";
 
   document.getElementById("res-heatmap").src = "/heatmap?t=" + Date.now();
+  document.getElementById("res-class-lbl").textContent =
+    d.classifier_mode === "resnet" ? "ResNet18 Classification" : "Feature-Based Classification";
 
   const cls    = d.classification || "Unknown";
   const conf   = d.confidence     || 0;
@@ -1146,16 +1196,38 @@ function populateResults(d, rep) {
     ltr < -50 ? "⚠ Regression (" + Math.round(ltr) + "px)" :
                 "Neutral (" + Math.round(ltr) + "px)";
 
+  // risk score bar (algo mode only)
+  const riskWrap = document.getElementById("res-risk-wrap");
+  if (d.risk_score !== null && d.classifier_mode === "algo") {
+    riskWrap.style.display = "block";
+    const pct = Math.round(d.risk_score * 100);
+    document.getElementById("res-risk-fill").style.width  = pct + "%";
+    document.getElementById("res-risk-fill").style.background =
+      pct >= 55 ? "#c4432a" : pct <= 40 ? "#2a7f4f" : "#d4922a";
+    document.getElementById("res-risk-label").textContent = "Risk Score: " + pct + " / 100";
+  } else {
+    riskWrap.style.display = "none";
+  }
+
   const note = document.getElementById("res-note");
   note.style.display = "block";
+  // prefer server-generated summary (algo mode); fall back to generic copy
+  if (d.summary) {
+    note.textContent = d.summary + (d.classifier_mode === "algo"
+      ? "  This is a screening tool only — consult a specialist for formal assessment."
+      : "");
+  } else if (isDys) {
+    note.textContent = "Pattern is consistent with dyslexic tendencies. This is a screening tool only — please consult a specialist for formal assessment.";
+  } else if (isNorm) {
+    note.textContent = "Gaze pattern is consistent with typical reading. No significant dyslexic markers detected.";
+  } else {
+    note.textContent = "Classification inconclusive. Try a longer reading session for a more reliable result.";
+  }
   if (isDys) {
-    note.textContent = "Pattern is consistent with dyslexic tendencies. Elevated saccade activity and gaze regression are common markers. This is a screening tool only — please consult a specialist for formal assessment.";
     note.style.cssText += ";background:#fff0ee;border:1px solid #c4432a;color:#7a2a1a";
   } else if (isNorm) {
-    note.textContent = "Gaze pattern is consistent with typical reading. Left-to-right progression and fixation density appear within normal range. No significant dyslexic markers detected.";
     note.style.cssText += ";background:#f0fff4;border:1px solid #2a7f4f;color:#1a4a2a";
   } else {
-    note.textContent = "Classification inconclusive. Gaze data may be insufficient or model confidence is low. Try a longer reading session for a more reliable result.";
     note.style.cssText += ";background:#f5f1ea;border:1px solid #e0d8cc;color:#8a7f74";
   }
 
@@ -1174,8 +1246,23 @@ def realtime():
     return render_template_string(REALTIME_HTML)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="NeuroScan — Eye-Tracking Gaze Analysis")
+    group  = parser.add_mutually_exclusive_group()
+    group.add_argument("--algo",   action="store_true", default=True,
+                       help="Feature-based classifier (default)")
+    group.add_argument("--resnet", action="store_true",
+                       help="ResNet18 heatmap classifier")
+    args = parser.parse_args()
+
+    if args.resnet:
+        CLASSIFIER_MODE = "resnet"
+        load_resnet18()
+    else:
+        CLASSIFIER_MODE = "algo"
+
     print("=" * 55)
     print("NeuroScan — Eye-Tracking Gaze Analysis")
-    print("Open http://localhost:5000")
+    print(f"Classifier : {'ResNet18 (heatmap)' if CLASSIFIER_MODE == 'resnet' else 'Feature-based (algo)'}")
+    print("Open http://localhost:3000")
     print("=" * 55)
     app.run(host="0.0.0.0", port=3000, debug=False, threaded=True)
