@@ -671,6 +671,39 @@ def overlay():
         return send_file(OVERLAY_PATH, mimetype="image/png")
     return "", 404
 
+@app.route("/report")
+def report():
+    try:
+        frames = 0
+        fixation_events = 0
+        saccade_events = 0
+        xs, ys = [], []
+        prev_fix = False
+        with open(CSV_PATH, newline="") as f:
+            for row in csv.DictReader(f):
+                frames += 1
+                xs.append(float(row["x"]))
+                ys.append(float(row["y"]))
+                fix = row["fixation"] == "True"
+                if fix and not prev_fix:
+                    fixation_events += 1
+                if row["saccade"] == "True":
+                    saccade_events += 1
+                prev_fix = fix
+        duration_s = round(frames / 30.0, 1)
+        spread_x = float(np.std(xs)) if xs else 0.0
+        spread_y = float(np.std(ys)) if ys else 0.0
+        mid = len(xs) // 2
+        ltr_score = float(np.mean(xs[mid:]) - np.mean(xs[:mid])) if mid > 10 else 0.0
+        return jsonify(frames=frames, duration_s=duration_s,
+                       fixation_events=fixation_events, saccade_events=saccade_events,
+                       spread_x=round(spread_x, 1), spread_y=round(spread_y, 1),
+                       ltr_score=round(ltr_score, 1), gaze_count=len(xs))
+    except Exception as e:
+        return jsonify(error=str(e), frames=0, duration_s=0.0,
+                       fixation_events=0, saccade_events=0,
+                       spread_x=0.0, spread_y=0.0, ltr_score=0.0, gaze_count=0)
+
 def gen_frames():
     while True:
         jpg = frame_buf.get("jpg")
@@ -773,6 +806,32 @@ body{background:#0d0d0d;overflow:hidden}
 #pip{position:fixed;bottom:20px;right:20px;width:160px;border-radius:10px;overflow:hidden;border:1px solid rgba(0,0,0,.12);z-index:20;box-shadow:0 4px 18px rgba(0,0,0,.15)}
 #pip img{width:100%;display:block}
 #pip-label{position:absolute;top:6px;left:6px;background:rgba(196,67,42,.85);color:#fff;font-family:'DM Mono',monospace;font-size:.52rem;padding:1px 6px;border-radius:100px;letter-spacing:.06em}
+
+/* ── results view ── */
+#results-view{display:none;position:fixed;inset:0;overflow-y:auto;background:#f5f1ea;z-index:50}
+.res-bar{background:#1a1612;padding:0 32px;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:10}
+.res-bar-title{font-family:'DM Mono',monospace;font-size:.75rem;color:rgba(255,255,255,.6);letter-spacing:.1em;text-transform:uppercase}
+.res-body{max-width:1100px;margin:0 auto;padding:32px 24px}
+.res-grid{display:grid;grid-template-columns:1fr 340px;gap:24px;align-items:start}
+.res-card{background:#fff;border:1px solid #e0d8cc;border-radius:14px;overflow:hidden;box-shadow:0 2px 12px rgba(26,22,18,.06)}
+.res-card-head{padding:14px 20px;border-bottom:1px solid #e0d8cc;font-family:'DM Mono',monospace;font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:#8a7f74}
+.res-card-body{padding:16px 20px}
+#res-heatmap{width:100%;border-radius:8px;display:block}
+.class-badge{border-radius:10px;padding:20px;text-align:center;margin-bottom:16px;border:1.5px solid #e0d8cc}
+.class-badge.dyslexic{background:#fff0ee;border-color:#c4432a}
+.class-badge.nondyslexic{background:#f0fff4;border-color:#2a7f4f}
+.class-lbl{font-family:'DM Mono',monospace;font-size:.6rem;letter-spacing:.16em;text-transform:uppercase;color:#8a7f74;margin-bottom:8px}
+.class-name{font-size:1.5rem;font-weight:700;font-family:'Plus Jakarta Sans',sans-serif;margin-bottom:4px}
+.class-conf-txt{font-family:'DM Mono',monospace;font-size:.78rem;color:#8a7f74}
+.conf-bar{height:6px;background:#e0d8cc;border-radius:100px;margin-top:10px;overflow:hidden}
+.conf-fill{height:100%;border-radius:100px;transition:width .8s ease}
+.stat-row{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #f0ebe0}
+.stat-row:last-child{border-bottom:none}
+.stat-k{font-family:'DM Mono',monospace;font-size:.63rem;color:#8a7f74;text-transform:uppercase;letter-spacing:.06em}
+.stat-v{font-family:'DM Mono',monospace;font-size:.8rem;color:#1a1612;font-weight:500}
+.loading-state{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:100px 0;gap:16px}
+.spinner-lg{width:40px;height:40px;border:3px solid #e0d8cc;border-top-color:#1a7a6e;border-radius:50%;animation:spin .8s linear infinite}
+.loading-txt{font-family:'DM Mono',monospace;font-size:.75rem;color:#8a7f74;letter-spacing:.06em}
 </style>
 </head>
 <body>
@@ -836,6 +895,79 @@ body{background:#0d0d0d;overflow:hidden}
     <img src="/video_feed" alt="cam"/>
     <div id="pip-label">● CAM</div>
   </div>
+</div>
+
+<!-- results view -->
+<div id="results-view">
+  <div class="res-bar">
+    <span class="res-bar-title">NeuroScan · Session Results</span>
+    <button onclick="location.reload()" style="padding:5px 16px;background:rgba(196,67,42,.85);color:#fff;border:none;border-radius:100px;font-family:'DM Mono',monospace;font-size:.63rem;cursor:pointer;letter-spacing:.06em">↩ New Session</button>
+  </div>
+  <div class="res-body">
+    <div id="results-loading" class="loading-state">
+      <div class="spinner-lg"></div>
+      <div class="loading-txt">Generating heatmap &amp; analysis…</div>
+    </div>
+    <div id="results-content" style="display:none">
+      <div class="res-grid">
+        <div>
+          <div class="res-card" style="margin-bottom:14px">
+            <div class="res-card-head">Gaze Heatmap — Reading Task</div>
+            <div class="res-card-body" style="padding:12px"><img id="res-heatmap" src="" alt="Heatmap"/></div>
+          </div>
+          <button onclick="showOverlayModal()"
+            style="width:100%;padding:11px;background:#1a7a6e;color:#fff;border:none;border-radius:9px;font-family:'DM Mono',monospace;font-size:.72rem;cursor:pointer;letter-spacing:.06em;margin-bottom:16px">
+            ⌖ View Gaze Overlay (Pixel-Aligned)
+          </button>
+        </div>
+        <div>
+          <div id="res-class-card" class="class-badge">
+            <div class="class-lbl">ResNet18 Classification</div>
+            <div id="res-class-name" class="class-name"></div>
+            <div id="res-class-conf-txt" class="class-conf-txt"></div>
+            <div class="conf-bar"><div id="res-conf-fill" class="conf-fill"></div></div>
+          </div>
+          <div class="res-card">
+            <div class="res-card-head">Session Diagnostics</div>
+            <div class="res-card-body" style="padding:0 20px">
+              <div class="stat-row"><span class="stat-k">Duration</span><span class="stat-v" id="r-duration">—</span></div>
+              <div class="stat-row"><span class="stat-k">Gaze Points</span><span class="stat-v" id="r-pts">—</span></div>
+              <div class="stat-row"><span class="stat-k">Fixation Events</span><span class="stat-v" id="r-fix">—</span></div>
+              <div class="stat-row"><span class="stat-k">Saccade Events</span><span class="stat-v" id="r-sac">—</span></div>
+              <div class="stat-row"><span class="stat-k">Horiz. Spread</span><span class="stat-v" id="r-sx">—</span></div>
+              <div class="stat-row"><span class="stat-k">Vert. Coverage</span><span class="stat-v" id="r-sy">—</span></div>
+              <div class="stat-row"><span class="stat-k">L→R Progression</span><span class="stat-v" id="r-ltr">—</span></div>
+            </div>
+          </div>
+          <div id="res-note" style="margin-top:14px;padding:14px 16px;border-radius:10px;font-family:'DM Mono',monospace;font-size:.68rem;line-height:1.8;display:none"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- pixel-aligned overlay modal: same layout as gaze-view + RGBA heatmap on top -->
+<div id="rt-overlay-modal" style="display:none;position:fixed;inset:0;z-index:9000;background:#f5f1ea;overflow:hidden;">
+  <div class="res-bar">
+    <span class="res-bar-title">NeuroScan · Gaze Overlay</span>
+    <button onclick="document.getElementById('rt-overlay-modal').style.display='none'"
+      style="padding:5px 16px;background:rgba(196,67,42,.85);color:#fff;border:none;border-radius:100px;font-family:'DM Mono',monospace;font-size:.63rem;cursor:pointer;letter-spacing:.06em">✕ Close</button>
+  </div>
+  <div style="height:4px;background:#e0d8cc"></div>
+  <div style="position:absolute;top:56px;left:50%;transform:translateX(-50%);width:min(760px,86vw);padding:44px 0 60px;">
+    <div class="r-label">Reading Task · Read naturally</div>
+    <div class="r-title">Alice's Adventures in Wonderland</div>
+    <div class="r-byline">— Lewis Carroll</div>
+    <div class="r-rule"></div>
+    <div class="r-body">
+      <p>Alice was beginning to get very tired of sitting by her sister on the bank, and of having nothing to do. Once or twice she had peeped into the book her sister was reading, but it had no pictures or conversations in it, and what is the use of a book without pictures or conversations?</p>
+      <p>So she was considering in her own mind whether the pleasure of making a daisy-chain would be worth the trouble of getting up and picking the daisies, when suddenly a White Rabbit with pink eyes ran close by her.</p>
+      <p>There was nothing so very remarkable in that, nor did Alice think it so very much out of the way to hear the Rabbit say to itself, "Oh dear! Oh dear! I shall be late!" But when the Rabbit actually took a watch out of its waistcoat-pocket and looked at it, Alice started to her feet.</p>
+      <p>She had never before seen a rabbit with either a waistcoat-pocket, or a watch to take out of it, and, burning with curiosity, she ran across the field after it and was just in time to see it pop down a large rabbit-hole under the hedge.</p>
+    </div>
+  </div>
+  <img id="rt-overlay-img" src="" alt=""
+    style="position:fixed;inset:0;width:100vw;height:100vh;object-fit:fill;pointer-events:none;z-index:9001;"/>
 </div>
 
 <script>
@@ -965,7 +1097,73 @@ function stopSession() {
   clearInterval(gazeInterval);
   fetch("/stop");
   if (document.fullscreenElement) document.exitFullscreen();
-  setTimeout(() => location.reload(), 400);
+  document.getElementById("gaze-view").style.display = "none";
+  document.getElementById("results-view").style.display = "block";
+  checkResults();
+}
+
+function checkResults() {
+  fetch("/state").then(r => r.json()).then(d => {
+    if (d.heatmap_ready) {
+      fetch("/report").then(r => r.json()).then(rep => populateResults(d, rep));
+    } else {
+      setTimeout(checkResults, 1500);
+    }
+  }).catch(() => setTimeout(checkResults, 2000));
+}
+
+function populateResults(d, rep) {
+  document.getElementById("results-loading").style.display = "none";
+  document.getElementById("results-content").style.display = "block";
+
+  document.getElementById("res-heatmap").src = "/heatmap?t=" + Date.now();
+
+  const cls    = d.classification || "Unknown";
+  const conf   = d.confidence     || 0;
+  const isDys  = cls === "Dyslexic";
+  const isNorm = cls === "Non-Dyslexic";
+  const card   = document.getElementById("res-class-card");
+  card.className = "class-badge" + (isDys ? " dyslexic" : isNorm ? " nondyslexic" : "");
+  const nameEl = document.getElementById("res-class-name");
+  nameEl.textContent  = cls;
+  nameEl.style.color  = isDys ? "#c4432a" : isNorm ? "#2a7f4f" : "#8a7f74";
+  document.getElementById("res-class-conf-txt").textContent = "Confidence: " + conf + "%";
+  const fill = document.getElementById("res-conf-fill");
+  fill.style.width      = conf + "%";
+  fill.style.background = isDys ? "#c4432a" : "#2a7f4f";
+
+  const durMin = Math.floor(rep.duration_s / 60);
+  const durSec = Math.round(rep.duration_s % 60);
+  document.getElementById("r-duration").textContent = durMin > 0 ? durMin + "m " + durSec + "s" : rep.duration_s + "s";
+  document.getElementById("r-pts").textContent      = (rep.gaze_count || 0).toLocaleString();
+  document.getElementById("r-fix").textContent      = rep.fixation_events;
+  document.getElementById("r-sac").textContent      = rep.saccade_events;
+  document.getElementById("r-sx").textContent       = Math.round(rep.spread_x) + " px σ";
+  document.getElementById("r-sy").textContent       = Math.round(rep.spread_y) + " px σ";
+  const ltr = rep.ltr_score;
+  document.getElementById("r-ltr").textContent =
+    ltr > 50  ? "↔ Forward (+" + Math.round(ltr) + "px)" :
+    ltr < -50 ? "⚠ Regression (" + Math.round(ltr) + "px)" :
+                "Neutral (" + Math.round(ltr) + "px)";
+
+  const note = document.getElementById("res-note");
+  note.style.display = "block";
+  if (isDys) {
+    note.textContent = "Pattern is consistent with dyslexic tendencies. Elevated saccade activity and gaze regression are common markers. This is a screening tool only — please consult a specialist for formal assessment.";
+    note.style.cssText += ";background:#fff0ee;border:1px solid #c4432a;color:#7a2a1a";
+  } else if (isNorm) {
+    note.textContent = "Gaze pattern is consistent with typical reading. Left-to-right progression and fixation density appear within normal range. No significant dyslexic markers detected.";
+    note.style.cssText += ";background:#f0fff4;border:1px solid #2a7f4f;color:#1a4a2a";
+  } else {
+    note.textContent = "Classification inconclusive. Gaze data may be insufficient or model confidence is low. Try a longer reading session for a more reliable result.";
+    note.style.cssText += ";background:#f5f1ea;border:1px solid #e0d8cc;color:#8a7f74";
+  }
+
+  document.getElementById("rt-overlay-img").src = "/overlay?t=" + Date.now();
+}
+
+function showOverlayModal() {
+  document.getElementById("rt-overlay-modal").style.display = "block";
 }
 </script>
 </body>
