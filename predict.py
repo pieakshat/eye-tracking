@@ -194,6 +194,20 @@ def gen_heatmap():
             rgba[:, :, 3] = np.where(hm > 0.01, 0.15 + hm * 0.65, 0.0)
             return rgba
 
+        # ── waypoints (screen-space, shared by heatmap + overlay) ───────────
+        # Divide the session into N equal time-windows; take median position
+        # per window. Median is stable against within-window noise/drift.
+        N_WP  = 25
+        n_pts = len(xs)
+        step  = max(1, n_pts // N_WP)
+        raw_wp_x, raw_wp_y = [], []          # screen pixels
+        for i in range(0, n_pts, step):
+            chunk_x = xs[i:i+step]
+            chunk_y = ys[i:i+step]
+            if len(chunk_x):
+                raw_wp_x.append(float(np.median(chunk_x)))
+                raw_wp_y.append(float(np.median(chunk_y)))
+
         # ── matplotlib report heatmap (with text backdrop) ────────────────
         hm = make_hm(xs, ys, W, H, sigma=14)
 
@@ -226,6 +240,34 @@ def gen_heatmap():
         ax.imshow(hm_to_rgba(hm), extent=[0, W, H, 0],
                   interpolation="bilinear", origin="upper")
 
+        # scale waypoints to matplotlib canvas and draw reading path
+        if len(raw_wp_x) >= 2:
+            wp_x = [x / scr_w * W for x in raw_wp_x]
+            wp_y = [y / scr_h * H for y in raw_wp_y]
+
+            ax.plot(wp_x, wp_y, color="black", lw=0.9, alpha=0.45, zorder=5,
+                    solid_capstyle="round", solid_joinstyle="round")
+
+            for i in range(0, len(wp_x) - 1, 3):
+                if np.hypot(wp_x[i+1]-wp_x[i], wp_y[i+1]-wp_y[i]) < 8:
+                    continue
+                ax.annotate("",
+                    xy=(wp_x[i+1], wp_y[i+1]), xytext=(wp_x[i], wp_y[i]),
+                    arrowprops=dict(arrowstyle="-|>", color="black",
+                                    lw=1.2, mutation_scale=13, alpha=0.80),
+                    zorder=6)
+
+            ax.scatter(wp_x[0],  wp_y[0],  s=60, color="#4dd0e1", zorder=7,
+                       edgecolors="black", linewidths=0.8)
+            ax.scatter(wp_x[-1], wp_y[-1], s=60, color="#ff7043", zorder=7,
+                       edgecolors="black", linewidths=0.8)
+            ax.text(wp_x[0]  + 12, wp_y[0],  "start", fontsize=7.5,
+                    color="#1a1612", va="center", zorder=7,
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.60, ec="none"))
+            ax.text(wp_x[-1] + 12, wp_y[-1], "end",   fontsize=7.5,
+                    color="#1a1612", va="center", zorder=7,
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.60, ec="none"))
+
         sm = plt.cm.ScalarMappable(cmap=CMAP, norm=plt.Normalize(vmin=0, vmax=1))
         sm.set_array([])
         cbar = plt.colorbar(sm, ax=ax, fraction=0.02, pad=0.01)
@@ -240,8 +282,48 @@ def gen_heatmap():
         plt.close()
 
         # ── RGBA overlay at exact screen resolution ────────────────────────
-        hm_scr = make_hm(xs, ys, scr_w, scr_h, sigma=max(scr_w, scr_h) * 0.020)
+        hm_scr   = make_hm(xs, ys, scr_w, scr_h, sigma=max(scr_w, scr_h) * 0.020)
         ov_uint8 = (hm_to_rgba(hm_scr) * 255).astype(np.uint8)
+
+        # draw reading-path arrows onto the overlay with PIL
+        if len(raw_wp_x) >= 2:
+            import math
+            from PIL import ImageDraw
+            ov_img  = Image.fromarray(ov_uint8, mode="RGBA")
+            draw    = ImageDraw.Draw(ov_img, "RGBA")
+
+            # connecting line
+            line_pts = [(int(x), int(y)) for x, y in zip(raw_wp_x, raw_wp_y)]
+            draw.line(line_pts, fill=(0, 0, 0, 150), width=2)
+
+            # filled arrowhead triangles every 3 segments
+            head_len, head_w = 22, 10
+            for i in range(0, len(raw_wp_x) - 1, 3):
+                x0, y0 = raw_wp_x[i], raw_wp_y[i]
+                x1, y1 = raw_wp_x[i+1], raw_wp_y[i+1]
+                dist = math.hypot(x1 - x0, y1 - y0)
+                if dist < 14:
+                    continue
+                ux, uy = (x1-x0)/dist, (y1-y0)/dist   # unit direction
+                px, py = -uy, ux                        # perpendicular
+                tip = (int(x1), int(y1))
+                bl  = (int(x1 - head_len*ux + head_w*px),
+                       int(y1 - head_len*uy + head_w*py))
+                br  = (int(x1 - head_len*ux - head_w*px),
+                       int(y1 - head_len*uy - head_w*py))
+                draw.polygon([tip, bl, br], fill=(0, 0, 0, 210))
+
+            # start (cyan) and end (orange) dots
+            r = 11
+            sx, sy = int(raw_wp_x[0]),  int(raw_wp_y[0])
+            ex, ey = int(raw_wp_x[-1]), int(raw_wp_y[-1])
+            draw.ellipse([sx-r, sy-r, sx+r, sy+r],
+                         fill=(77, 208, 225, 230), outline=(0, 0, 0, 200), width=2)
+            draw.ellipse([ex-r, ey-r, ex+r, ey+r],
+                         fill=(255, 112, 67, 230), outline=(0, 0, 0, 200), width=2)
+
+            ov_uint8 = np.array(ov_img)
+
         Image.fromarray(ov_uint8, mode="RGBA").save(OVERLAY_PATH)
         print("Overlay saved:", OVERLAY_PATH)
 
